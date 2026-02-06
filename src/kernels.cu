@@ -83,7 +83,7 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
  * @param[in] is_causal Whether to apply causal masking
  */
 
- // 计算 4D 索引，行主序存储
+// 计算 4D 索引，行主序存储
  __device__ __forceinline__  int idx4d(int i0, int i1, int i2, int i3,
                                        int D1, int  D2, int D3) {
   return i0 * (D1 * D2 *  D3) + i1 * (D2 * D3) + i2 * D3 + i3;
@@ -110,68 +110,81 @@ __device__ __forceinline__ half fromFloat<half>(float x) {
   return __float2half(x);
 }
 
+#define MAX_HEAD_DIM 256
 
-// FlashAttention Kernel: 使用 Online Softmax 算法
-// 每个线程负责计算一个输出元素 O[b, t, h, d]
+// FlashAttention Kernel: 块级并行 + 共享内存缓存 K
+// 每个 block 处理一个 [b, t, h]，每个线程负责一个 d 维度
 template <typename T>
 __global__ void flashAttentionKernel(
     const T* Q,  const T* K, const T* V, T* O,
-    int batch_size, int tgt_seq_len, int src_seq_len, 
+    int batch_size, int tgt_seq_len, int src_seq_len,
     int query_heads, int kv_heads, int head_dim, bool is_causal) {
-  
-  // 计算总输出元素数，每个线程处理一个
-  int total = batch_size * tgt_seq_len * query_heads * head_dim;
-  int idx = threadIdx.x + blockIdx.x * blockDim.x;
-  if (idx >= total) return;
 
-  // 从线性索引反推 4D 坐标 [b, t, h, d]
-  int d = idx % head_dim;
-  int h = (idx / head_dim) % query_heads;
-  int t = (idx / head_dim / query_heads) % tgt_seq_len;
-  int b = idx / head_dim / query_heads / tgt_seq_len;
+  // 从 block 索引计算 [b, t, h]
+  int block_idx = blockIdx.x;
+  int h = block_idx % query_heads;
+  int t = (block_idx / query_heads) % tgt_seq_len;
+  int b = block_idx / query_heads / tgt_seq_len;
+
+  // 每个线程负责一个 d 维度
+  int tid = threadIdx.x;
 
   // GQA 映射
-  // 多个 query head 共享同一个 kv head
   int group_size = query_heads / kv_heads;
   int kv_h = h / group_size;
 
+  // 共享内存缓存 K 向量
+  __shared__ float K_shared[MAX_HEAD_DIM];
+
+  // 预计算基地址
+  int q_base = idx4d(b, t, h, 0, tgt_seq_len, query_heads, head_dim);
+  int kv_stride_s = kv_heads * head_dim;
+  int kv_base = b * src_seq_len * kv_stride_s + kv_h * head_dim;
+
+  // Causal mask 边界
+  int s_end = is_causal ? (t + 1 < src_seq_len ? t + 1 : src_seq_len) : src_seq_len;
+
   // Online Softmax 状态变量
-  float m_i = -INFINITY;  // 当前最大 score
-  float l_i = 0.0f;        // softmax 分母累积
-  float o_i = 0.0f;        // 加权输出累积
+  float m_i = -INFINITY;
+  float l_i = 0.0f;
+  float o_i = 0.0f;
 
   // 遍历所有 key/value 位置
-  for (int s = 0; s <  src_seq_len; s++) {
-    // Causal mask: 只能看见当前位置及之前的 token
-    if (is_causal &&  s > t) continue;
+  for (int s = 0; s < s_end; s++) {
+    int kv_offset = kv_base + s * kv_stride_s;
 
-    // 计算 score = q · k / sqrt(head_dim)
+    // 1. 协作加载 K 到共享内存
+    if (tid < head_dim) {
+      K_shared[tid] = toFloat(K[kv_offset + tid]);
+    }
+    __syncthreads();
+
+    // 2. 每个线程独立顺序计算完整 score（保持累加顺序一致）
     float score = 0.0f;
     for (int i = 0; i < head_dim; i++) {
-      int q_idx = idx4d(b, t, h, i, tgt_seq_len, query_heads, head_dim);
-      int k_idx = idx4d(b, s, kv_h, i, src_seq_len, kv_heads, head_dim);
-      score += toFloat(Q[q_idx]) * toFloat(K[k_idx]);
+      score += toFloat(Q[q_base + i]) * K_shared[i];
     }
     score /= sqrtf((float)head_dim);
-  
-    // 获取 V[b, s, kv_h, d]的值
-    int v_idx = idx4d(b, s, kv_h, d, src_seq_len, kv_heads, head_dim);
-    float v = toFloat(V[v_idx]);
 
-    // Online Softmax 更新
+    // 3. Online Softmax 更新
     float m_prev = m_i;
-    m_i = fmax(m_i, score);  // 更新最大值
-    float correction = expf(m_prev - m_i);  // 之前累积的修正因子
-    float  weight = expf(score - m_i);  // 当前位置的权重
-    l_i = l_i * correction + weight;    // 更新分母
-    o_i = o_i * correction + weight * v;  // 更新加权和
+    m_i = fmaxf(m_i, score);
+    float correction = expf(m_prev - m_i);
+    float weight = expf(score - m_i);
+    l_i = l_i * correction + weight;
+
+    // 4. 累加 V 的贡献
+    if (tid < head_dim) {
+      float v = toFloat(V[kv_offset + tid]);
+      o_i = o_i * correction + weight * v;
+    }
+    __syncthreads();
   }
 
   // 最终输出 = 加权和 / 分母
-  if (l_i > 0.0f) {
-    O[idx] = fromFloat<T>(o_i / l_i);
-  } else {
-    O[idx] = fromFloat<T>(0.0f);
+  if (tid < head_dim) {
+    int o_idx = idx4d(b, t, h, tid, tgt_seq_len, query_heads, head_dim);
+    O[o_idx] = fromFloat<T>(l_i > 0.0f ? (o_i / l_i) : 0.0f);
   }
 }
 
@@ -199,10 +212,11 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
   cudaMemcpy(d_k, h_k.data(), kv_size * sizeof(T), cudaMemcpyHostToDevice);
   cudaMemcpy(d_v, h_v.data(), kv_size * sizeof(T), cudaMemcpyHostToDevice);
 
-  // 3. 启动kernel 
-  int threads = 256;
-  int blocks = (o_size + threads - 1) / threads;
-  flashAttentionKernel<T><<<blocks, threads>>>(
+  // 3. 启动kernel
+  int num_blocks = batch_size * target_seq_len * query_heads;
+  int threads_per_block = std::max(head_dim, 32);
+  threads_per_block = std::min(threads_per_block, 256);
+  flashAttentionKernel<T><<<num_blocks, threads_per_block>>>(
     d_q, d_k, d_v, d_o,
     batch_size, target_seq_len, src_seq_len,
     query_heads, kv_heads, head_dim, is_causal);
@@ -211,7 +225,7 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
   h_o.resize(o_size);
   cudaMemcpy(h_o.data(), d_o, o_size * sizeof(T), cudaMemcpyDeviceToHost);
 
-  // 5. 适当 GPU 内存
+  // 5. 释放 GPU 内存
   cudaFree(d_q);
   cudaFree(d_k);
   cudaFree(d_v);
